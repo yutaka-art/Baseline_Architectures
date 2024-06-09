@@ -1,0 +1,194 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+    - src/*
+
+variables:
+  buildConfiguration: 'Release'
+  dotnetSdkVersion: '8.x'
+  solution: '**/*.sln'
+  unitTestProjects: '**/*.UnitTests/*.csproj'
+  integrationTestProjects: '**/*.IntegrationTests/*.csproj'
+  targetProjects: '**/DemoSite/*.csproj'
+  appServiceNameDev: 'asp-az400-book-dev'
+  appServiceNameStg: 'asp-az400-book-stg'
+  ServiceConnectionName: 'avanadeosadatest_Tenant_Connection'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  # Analyze
+  - stage: 'Analyze'
+    jobs:
+    - job: AnalyzeJob
+      displayName: 'Analyze Job'
+      steps:
+        # >>> Microsoft Defender for DevOps ※実行結果詳細をScanタブへ表示するには"SARIF SAST Scans Tab"拡張機能をインストールする必要があります
+        - task: UseDotNet@2
+          displayName: 'Use .NET SDK $(dotnetSdkVersion)'
+          inputs:
+            version: '$(dotnetSdkVersion)'
+            performMultiLevelLookup: true
+            includePreviewVersions: true
+
+        - task: MicrosoftSecurityDevOps@1
+          displayName: 'Microsoft Security DevOps'
+          inputs:
+            categories: 'secrets, code'
+            break: true
+        # <<< Microsoft Defender for DevOps ※実行結果詳細をScanタブへ表示するには"SARIF SAST Scans Tab"拡張機能をインストールする必要があります
+
+        # # >>> SonarCloud
+        # - task: NuGetToolInstaller@1
+
+        # - task: NuGetCommand@2
+        #   inputs:
+        #     restoreSolution: '$(solution)'
+
+        # - task: SonarCloudPrepare@1
+        #   inputs:
+        #     SonarCloud: 'SonarCloud-Connection'
+        #     organization: 'az400-book'
+        #     scannerMode: 'MSBuild'
+        #     projectKey: 'freeplanets_Hyperion'
+        #     projectName: 'Hyperion'
+
+        # - task: DotNetCoreCLI@2
+        #   inputs:
+        #     command: 'build'
+        #     projects: $(targetProjects)
+        #     arguments: '--configuration $(buildConfiguration)'
+
+        # - task: SonarCloudAnalyze@1
+
+        # - task: SonarCloudPublish@1
+        #   inputs:
+        #     pollingTimeoutSec: '300'
+        # # <<< SonarCloud
+
+  # Build
+  - stage: 'Build'
+    dependsOn: Analyze
+    condition:  succeeded()
+    displayName: 'Build the web application'
+    jobs:
+      - job: BuildJob
+        displayName: 'Build Job'
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Use .NET SDK $(dotnetSdkVersion)'
+            inputs:
+              version: '$(dotnetSdkVersion)'
+              performMultiLevelLookup: true
+              includePreviewVersions: true # Required for preview versions
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore project dependencies'
+            inputs:
+              command: 'restore'
+              projects: $(unitTestProjects)
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Build the project - $(buildConfiguration)'
+            inputs:
+              command: 'build'
+              projects: $(unitTestProjects)
+              arguments: '--no-restore --configuration $(buildConfiguration)'
+
+  # Unit Test
+  - stage: 'UnitTest'
+    displayName: 'Unit test the application'
+    dependsOn: Build
+    condition:  succeeded()
+    jobs:
+      - job: UnitTestJob
+        displayName: 'UnitTest Job'
+        steps:
+          - task: DotNetCoreCLI@2
+            displayName: 'Execute unit test'
+            inputs:
+              command: test
+              projects: $(unitTestProjects)
+              arguments: '--configuration $(buildConfiguration) --collect "Code coverage"'
+              publishTestResults: true
+
+          - task: PublishCodeCoverageResults@1
+            displayName: 'Publish code coverage report'
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: '$(Agent.TempDirectory)/**/coverage.cobertura.xml'
+
+  # Integration Test
+  - stage: 'IntegrationTest'
+    displayName: 'Integration test the application'
+    dependsOn: UnitTest
+    condition:  succeeded()
+    jobs:
+      - job: IntegrationTestJob
+        displayName: 'IntegrationTest Job'
+        steps:
+          - task: DotNetCoreCLI@2
+            displayName: 'Execute integration test'
+            inputs:
+              command: test
+              projects: $(integrationTestProjects)
+              arguments: '--configuration $(buildConfiguration) --collect "Code coverage"'
+              publishTestResults: true
+
+          - task: PublishCodeCoverageResults@1
+            displayName: 'Publish code coverage report'
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: '$(Agent.TempDirectory)/**/coverage.cobertura.xml'
+
+  # Publish
+  - stage: 'Publish'
+    dependsOn: IntegrationTest
+    condition:  succeeded()
+    jobs:
+    - job: PublishJob
+      displayName: 'Publish Job'
+      steps:
+        - task: DotNetCoreCLI@2
+          displayName: 'Publish the project - $(buildConfiguration)'
+          inputs:
+            command: 'publish'
+            projects: $(targetProjects)
+            publishWebProjects: false
+            arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/$(buildConfiguration)'
+            zipAfterPublish: true
+
+        - publish: '$(Build.ArtifactStagingDirectory)'
+          artifact: drop
+
+  # DeployToDev
+  - stage: 'DeployToDev'
+    displayName: 'Deploy to the dev environment'
+    dependsOn: Publish
+    condition:  succeeded()
+    jobs:
+    - template: templates/deployment.yml
+      parameters:
+        jobName: 'DeployToDevJob'
+        variableGroupName: 'DevRelease'
+        appName: '$(appServiceNameDev)'
+        environment: 'dev'
+        message: '$(devEnvMessage)'
+
+  # DeployToStaging
+  - stage: 'DeployToStaging'
+    displayName: 'Deploy to the staging environment'
+    dependsOn: DeployToDev
+    condition:  succeeded()
+    jobs:
+    - template: templates/deployment.yml
+      parameters:
+        jobName: DeployToStagingJob
+        variableGroupName: 'StgRelease'
+        appName: '$(appServiceNameStg)'
+        environment: 'staging'
+        message: '$(stagingEnvMessage)'
